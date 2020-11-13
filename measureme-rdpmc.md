@@ -31,12 +31,13 @@ By gathering groups of 10 runs per counter type (including a "zero" counter that
 Note that the totals are measured by `instructions-minus-irqs:u`, regardless of which counter is being used by the profiler, so the noise here is not indicative of the *quality* of the profile data, but rather the determinism of the whole execution (including sampling the counter used by the profiler).
 
 More details, and a revision history, are available in [a gist](https://gist.github.com/eddyb/7a0a55411441142765db6cfa41504e50), but these are the final results:
-|Counter|Total<br><small>`instructions-minus-irqs:u`</small>|Overhead from "Baseline"<br><small>(instructions per each of<br>1903881 counter reads)</small>|
-|-|-|-|
-|Baseline|63637621286 ±6||
-|`instructions:u`|63658815885 ±2|&nbsp;&nbsp;+11|
-|`instructions-minus-irqs:u`|63680307361 ±13|&nbsp;&nbsp;+22|
-|`wall-time`|63951958376 ±10275|+165|
+
+|<small>Counter</small>|<small>Total</small><br><sup>`instructions-minus-irqs:u`</sup>|<small>Overhead<br>from "Baseline"</small><br><sup>(for all 1903881<br>counter reads)</sup>|<small>Overhead<br>from "Baseline"</small><br><sup>(per each<br>counter read)</sup>|
+|-|-|-|-|
+|Baseline|63637621286 ±6|||
+|<sub>`instructions:u`</sub>|63658815885 ±2|&nbsp;&nbsp;+21194599 ±8|&nbsp;&nbsp;+11|
+|<sub>`instructions-minus-irqs:u`</sub>|63680307361 ±13|&nbsp;&nbsp;+42686075 ±19|&nbsp;&nbsp;+22|
+|<sub>`wall-time`</sub>|63951958376 ±10275|+314337090 ±10281|+165|
 
 From this we can gather that counting instructions, even when subtracting IRQs, can be an order of magnitude faster than measuring time (though this may vary depending on the actual instructions executed).
 
@@ -119,9 +120,7 @@ Using [`summarize aggregate`](https://github.com/rust-lang/measureme/pull/129) (
 
 These are similar to the previous "Results" section, but instead of libcore, they're for the `polkadot-runtime-common` crate, at [tag `v0.8.26`](https://github.com/paritytech/polkadot/tree/v0.8.26) (also in "check mode").
 
-In order to fully eliminate ASLR-like effects due to the use of `HashMap`/`HashSet` in proc macros, we had to change the behavior of `std::collections::hash_map::RandomState` to *not* use the `getrandom` syscall (this applies equally to all 3 counters).
-
-Long-term we'd want either `rustc`/`proc_macro` to hook `std` and disable `getrandom` for `HashMap`/`HashSet`, *or* some sort of tool that intercepts the `getrandom` syscall using `ptrace` and/or SECCOMP filters. Alternatively/additionally, we could try getting `std` to use the glibc wrapper when available, making it possible to use `LD_PRELOAD` to defuse `getrandom`.
+*See [Caveats/Non-deterministic proc macros](#Non-deterministic-proc-macros) below for an ASLR-like effect we encountered here (but not for libcore, as it uses no proc macros), and how we worked around it.*
 
 ### "Macro" noise (self time) <small>(for `polkadot-runtime-common`)</small>
 
@@ -206,6 +205,18 @@ And because it's *isolated* in those parts of the compiler, it has no effect wha
 In order to get the best results, disabling ASLR by e.g. running `rustc` under `setarch -R` is necessary.
 
 Note that the `rustup` wrapper binary which allows `rustc +foo ...` does not currently appear to propagate ASLR being disabled to the actual `rustc` binary (e.g. `~/.rustup/toolchains/.../bin/rustc`), so you will need to refer to it directly, for now.
+
+Long-term we may want to make `rustc`'s use of pointer hashing more intrinsically deterministic, by using special arenas which prefer known addresses, instead of letting the OS pick them.
+
+### Non-deterministic proc macros
+
+When profiling a `rustc` compilation which uses proc macros, they may contain arbitrary user code, including sources of randomness and IO. The easiest way this can impact the rest of `rustc` is through introducing ASLR-like effects with non-deterministic allocation sizes.
+
+For example, the very-widely-used `serde_derive` proc macro happens to use `HashSet`, which by default uses a randomized hash (just like `HashMap`), and that will result in different (re)allocation patterns of the `HashSet` heap data, effectivelly randomizing any heap addresses allocated afterwards (by other parts of `rustc`).
+
+In order to fully eliminate ASLR-like effects due to the use of `HashMap`/`HashSet` in proc macros, during testing and data collection, we had to temporarily change the behavior of `std::collections::hash_map::RandomState` to *not* use the `getrandom` syscall.
+
+Long-term we'd want either `rustc`/`proc_macro` to hook `std` and disable `getrandom` for `HashMap`/`HashSet`, *or* some sort of tool that intercepts the `getrandom` syscall using `ptrace` and/or SECCOMP filters. Alternatively/additionally, we could try getting `std` to use the glibc wrapper when available, making it possible to use `LD_PRELOAD` to defuse `getrandom`.
 
 ### Subtracting IRQs
 
@@ -331,8 +342,10 @@ While not making `rdpmc` self-serializing is a counterproductive design decision
 
 Coming back to the `perf_event_open` + `mmap` + `asm("rdpmc")` examples we found, none of them were using a "serializing instruction", so that's another downside to add, on top of the synchronized loop.
 
-As Intel and AMD do not entirely agree on which instructions count as "fully serializing", we had to go with the clunkier `cpuid` (which both Intel and AMD list in their documentation), even if we experimentally saw that e.g. `lfence` has a similar noise-reducing effect on AMD Zen (an effect which is likely only enabled as part of mitigations for speculative execution vulnerabilities such as Spectre).
+As Intel and AMD do not entirely agree on which instructions count as "fully serializing", we had to go with the clunkier `cpuid` (which both Intel and AMD document as "fully serializing"), even if we experimentally saw that e.g. `lfence` has a similar noise-reducing effect on AMD Zen (an effect which is likely only enabled as part of mitigations for speculative execution vulnerabilities such as Spectre).
 This was before we developed the `summarize aggregate` tool, so we had limited insight into fine-grained noise, but the difference between serialized and unserialized was visible in the variance of per-query statistics, i.e. in the `summarize summarize --json` data.
+
+There are [news of a possible `serialize` instruction](https://www.phoronix.com/scan.php?page=news_item&px=Linux-SERIALIZE-Sync-Core) which does exactly what's needed, and no more, but it looks like using it would require CPU detection and dynamically picking it (which would also allow using `lfence`, where happens to also be fully serializing).
 
 Out of all the noise prevention measures we've taken, this one has the least impact, as there aren't that many instruction reordering opportunities just before the `rdpmc`, so it's more of a preventative measure, and we may end up relaxing it in the future.
 
